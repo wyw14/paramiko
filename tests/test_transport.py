@@ -60,6 +60,7 @@ from paramiko.common import (
     MSG_USERAUTH_SUCCESS,
     byte_chr,
     cMSG_CHANNEL_WINDOW_ADJUST,
+    cMSG_GLOBAL_REQUEST,
     cMSG_UNIMPLEMENTED,
 )
 from paramiko.message import Message
@@ -992,6 +993,185 @@ class TransportTest(unittest.TestCase):
             assert "forwarding request denied" in str(e)
         else:
             assert False, "Did not raise SSHException!"
+
+    # --- global request waiter semantics ---------------------------------
+
+    def _global_request_in_thread(self, *args, **kwargs):
+        outcome = {}
+
+        def run():
+            try:
+                outcome["result"] = self.tc.global_request(*args, **kwargs)
+            except BaseException as e:
+                outcome["error"] = e
+
+        thread = threading.Thread(target=run)
+        thread.daemon = True
+        thread.start()
+        return thread, outcome
+
+    def _wait_for_pending_global_requests(self, count):
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if len(self.tc._global_responses) == count:
+                return
+            time.sleep(0.01)
+        raise AssertionError(
+            "Expected {:d} pending global requests, found {:d}".format(
+                count, len(self.tc._global_responses)
+            )
+        )
+
+    def test_successful_global_request_returns_reply_message(self):
+        self.setup_test_server()
+        response = self.tc.global_request("acceptable")
+        assert isinstance(response, Message)
+        assert self.server._global_request == "acceptable"
+
+    def test_failed_global_request_returns_none(self):
+        self.tc._send_user_message = Mock()
+        thread, outcome = self._global_request_in_thread("bogus")
+        self._wait_for_pending_global_requests(1)
+        self.tc._parse_request_failure(Message())
+        thread.join(2)
+        assert not thread.is_alive()
+        assert "error" not in outcome
+        assert outcome["result"] is None
+        assert len(self.tc._global_responses) == 0
+
+    def test_concurrent_global_requests_get_their_own_responses(self):
+        self.tc._send_user_message = Mock()
+        first_thread, first = self._global_request_in_thread("one")
+        second_thread, second = self._global_request_in_thread("two")
+        self._wait_for_pending_global_requests(2)
+        first_reply = Message()
+        first_reply.add_string("one-data")
+        second_reply = Message()
+        second_reply.add_string("two-data")
+        # Replies carry no request id; FIFO order is all we have.
+        self.tc._parse_request_success(first_reply)
+        self.tc._parse_request_success(second_reply)
+        first_thread.join(2)
+        second_thread.join(2)
+        assert first["result"] is first_reply
+        assert second["result"] is second_reply
+        assert len(self.tc._global_responses) == 0
+
+    def test_global_request_close_raises_saved_exception(self):
+        self.tc._send_user_message = Mock()
+        thread, outcome = self._global_request_in_thread("bogus")
+        self._wait_for_pending_global_requests(1)
+        self.tc.saved_exception = EOFError()
+        self.tc._abort_global_responses()
+        thread.join(2)
+        assert isinstance(outcome.get("error"), EOFError)
+        assert "result" not in outcome
+
+    def test_global_request_close_without_exception_raises_sshexception(self):
+        self.tc._send_user_message = Mock()
+        thread, outcome = self._global_request_in_thread("bogus")
+        self._wait_for_pending_global_requests(1)
+        self.tc._abort_global_responses()
+        thread.join(2)
+        assert isinstance(outcome.get("error"), SSHException)
+        assert "result" not in outcome
+
+    def test_global_request_timeout_is_local_cancel(self):
+        self.tc._send_user_message = Mock()
+        thread, outcome = self._global_request_in_thread("slow", timeout=0.2)
+        self._wait_for_pending_global_requests(1)
+        thread.join(2)
+        assert isinstance(outcome.get("error"), socket.timeout)
+        # The cancelled entry stays queued so its eventual reply is matched
+        # to (and discarded by) this request, not a different one.
+        assert len(self.tc._global_responses) == 1
+
+    def test_late_reply_after_timeout_does_not_go_to_other_request(self):
+        self.tc._send_user_message = Mock()
+        slow_thread, slow = self._global_request_in_thread(
+            "slow", timeout=0.2
+        )
+        self._wait_for_pending_global_requests(1)
+        slow_thread.join(2)
+        assert isinstance(slow.get("error"), socket.timeout)
+        late_reply = Message()
+        late_reply.add_string("late")
+        real_reply = Message()
+        real_reply.add_string("real")
+        other_thread, other = self._global_request_in_thread("other")
+        self._wait_for_pending_global_requests(2)
+        self.tc._parse_request_success(late_reply)
+        # Cancelled waiter consumed the stale reply; other request still
+        # pending.
+        self._wait_for_pending_global_requests(1)
+        self.tc._parse_request_success(real_reply)
+        other_thread.join(2)
+        assert "error" not in other
+        assert other["result"] is real_reply
+        assert len(self.tc._global_responses) == 0
+
+    def test_reply_then_close_keeps_delivered_success(self):
+        self.tc._send_user_message = Mock()
+        thread, outcome = self._global_request_in_thread("bogus")
+        self._wait_for_pending_global_requests(1)
+        reply = Message()
+        reply.add_string("data")
+        # Reply arrives first; the transport only shuts down afterwards.
+        self.tc._parse_request_success(reply)
+        self.tc._abort_global_responses()
+        thread.join(2)
+        assert "error" not in outcome
+        assert outcome["result"] is reply
+
+    def test_late_replies_after_close_do_not_revive_waiters(self):
+        self.tc._send_user_message = Mock()
+        first_thread, first = self._global_request_in_thread("one")
+        second_thread, second = self._global_request_in_thread("two")
+        self._wait_for_pending_global_requests(2)
+        self.tc._abort_global_responses()
+        first_thread.join(2)
+        second_thread.join(2)
+        assert isinstance(first.get("error"), SSHException)
+        assert isinstance(second.get("error"), SSHException)
+        # Nothing is waiting anymore; late replies are simply ignored and
+        # cannot complete the already-ended waits.
+        self.tc._parse_request_success(Message())
+        self.tc._parse_request_failure(Message())
+        assert "result" not in first
+        assert "result" not in second
+        assert len(self.tc._global_responses) == 0
+
+    def test_global_request_wait_false_keeps_fire_and_forget_behavior(self):
+        sent = Mock()
+        self.tc._send_user_message = sent
+        assert self.tc.global_request("keepalive@lag.net", wait=False) is None
+        assert sent.call_count == 1
+        message = Message(sent.call_args[0][0].asbytes())
+        assert message.get_byte() == cMSG_GLOBAL_REQUEST
+        assert message.get_text() == "keepalive@lag.net"
+        assert message.get_boolean() is False
+        assert len(self.tc._global_responses) == 0
+
+    def test_global_request_raises_on_real_transport_close(self):
+        self.setup_test_server()
+        reached = threading.Event()
+        release = threading.Event()
+
+        def slow_check(kind, msg):
+            reached.set()
+            return release.wait(2)
+
+        self.server.check_global_request = slow_check
+        thread, outcome = self._global_request_in_thread("slow")
+        assert reached.wait(2)
+        self.tc.close()
+        thread.join(2)
+        release.set()
+        assert isinstance(
+            outcome.get("error"), (SSHException, OSError, EOFError)
+        )
+
+    # ---------------------------------------------------------------------
 
     def _send_unimplemented(self, server_is_sender):
         self.setup_test_server()

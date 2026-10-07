@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import weakref
+from collections import deque
 from hashlib import md5, sha1, sha256, sha512
 
 from cryptography.hazmat.backends import default_backend
@@ -149,6 +150,36 @@ def _join_lingering_threads():
 import atexit
 
 atexit.register(_join_lingering_threads)
+
+
+class _GlobalRequestResponse:
+    """
+    A single outstanding global request whose caller is awaiting a reply.
+
+    RFC 4254 replies to global requests arrive in request order, so pending
+    requests are tracked FIFO.  ``status`` is only ever transitioned out of
+    :attr:`PENDING` once (under the Transport's global-response lock), which
+    guarantees the waiting caller observes exactly one outcome even when a
+    reply, a transport shutdown and a local timeout race with each other.
+    """
+
+    #: still waiting for a reply
+    PENDING = "pending"
+    #: server replied MSG_REQUEST_SUCCESS; ``response`` holds the Message
+    SUCCESS = "success"
+    #: server replied MSG_REQUEST_FAILURE
+    FAILURE = "failure"
+    #: transport closed before any reply was received
+    CLOSED = "closed"
+    #: caller stopped waiting locally (eg timeout); a late reply is consumed
+    #: but ignored
+    CANCELLED = "cancelled"
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.event = threading.Event()
+        self.response = None
+        self.status = self.PENDING
 
 
 class Transport(threading.Thread, ClosingContextManager):
@@ -527,8 +558,14 @@ class Transport(threading.Thread, ClosingContextManager):
         self.logger = util.get_logger(self.log_name)
         self.packetizer.set_log(self.logger)
         self.auth_handler = None
-        # response Message from an arbitrary global request
+        # response Message from an arbitrary global request (kept for
+        # backwards compatibility; per-request responses live on the
+        # _GlobalRequestResponse entries below)
         self.global_response = None
+        # FIFO of outstanding global requests awaiting a reply; replies
+        # arrive in request order (RFC 4254)
+        self._global_response_lock = threading.Lock()
+        self._global_responses = deque()
         # user-defined event callbacks
         self.completion_event = None
         # how long (seconds) to wait for the SSH banner
@@ -1208,10 +1245,26 @@ class Transport(threading.Thread, ClosingContextManager):
 
         self.packetizer.set_keepalive(interval, _request)
 
-    def global_request(self, kind, data=None, wait=True):
+    def global_request(self, kind, data=None, wait=True, timeout=None):
         """
         Make a global request to the remote host.  These are normally
         extensions to the SSH2 protocol.
+
+        When ``wait`` is true, exactly one outcome is ever returned to the
+        caller:
+
+        - a successful reply yields the reply `.Message`;
+        - a server-side refusal (``MSG_REQUEST_FAILURE``) yields ``None``;
+        - the connection closing before a reply arrives raises the fatal
+          connection exception (or `.SSHException` if there is none);
+        - ``timeout`` elapsing before any of the above raises
+          ``socket.timeout``; the request is only cancelled locally, so a
+          reply arriving later is consumed and ignored instead of being
+          matched against a different request.
+
+        Concurrent waiting requests are tracked independently, so their
+        replies can never be mixed up even though each reply only carries
+        the request's order rather than an identifier.
 
         :param str kind: name of the request.
         :param tuple data:
@@ -1219,14 +1272,28 @@ class Transport(threading.Thread, ClosingContextManager):
             request.
         :param bool wait:
             ``True`` if this method should not return until a response is
-            received; ``False`` otherwise.
+            received; ``False`` otherwise.  When ``False`` the request is
+            simply sent and ``None`` is returned immediately, without
+            registering a waiter.
+        :param float timeout:
+            optional number of seconds to wait for a response when ``wait``
+            is true.  ``None`` (the default) waits indefinitely.
         :return:
-            a `.Message` containing possible additional data if the request was
-            successful (or an empty `.Message` if ``wait`` was ``False``);
-            ``None`` if the request was denied.
+            a `.Message` containing possible additional data if the request
+            was successful; ``None`` if the request was denied.
+        :raises:
+            `.SSHException` -- if the connection closes before a reply is
+            received
+        :raises:
+            ``socket.timeout`` -- if ``timeout`` elapses with no reply
         """
+        waiter = None
         if wait:
-            self.completion_event = threading.Event()
+            waiter = _GlobalRequestResponse(kind)
+            # Register before sending so the FIFO order matches the wire
+            # order of the requests.
+            with self._global_response_lock:
+                self._global_responses.append(waiter)
         m = Message()
         m.add_byte(cMSG_GLOBAL_REQUEST)
         m.add_string(kind)
@@ -1234,16 +1301,82 @@ class Transport(threading.Thread, ClosingContextManager):
         if data is not None:
             m.add(*data)
         self._log(DEBUG, 'Sending global request "{}"'.format(kind))
-        self._send_user_message(m)
+        try:
+            self._send_user_message(m)
+        except BaseException:
+            # The request never hit the wire, so nobody will ever reply to
+            # this entry; drop it rather than let it swallow a later
+            # request's reply.
+            self._discard_global_response(waiter)
+            raise
         if not wait:
             return None
+        start = time.time()
         while True:
-            self.completion_event.wait(0.1)
-            if not self.active:
+            waiter.event.wait(0.1)
+            with self._global_response_lock:
+                status = waiter.status
+                if (
+                    status == _GlobalRequestResponse.PENDING
+                    and timeout is not None
+                    and time.time() - start >= timeout
+                ):
+                    # Local cancellation only: the entry is deliberately
+                    # left in the FIFO so the eventual reply is matched to
+                    # (and ignored by) this request.
+                    waiter.status = _GlobalRequestResponse.CANCELLED
+                    waiter.event.set()
+                    status = waiter.status
+            if status == _GlobalRequestResponse.PENDING:
+                continue
+            if status == _GlobalRequestResponse.SUCCESS:
+                return waiter.response
+            if status == _GlobalRequestResponse.FAILURE:
                 return None
-            if self.completion_event.is_set():
-                break
-        return self.global_response
+            if status == _GlobalRequestResponse.CANCELLED:
+                raise socket.timeout(
+                    "Timeout waiting for global request response"
+                )
+            # The connection died before a reply was received.
+            e = self.get_exception()
+            if e is None:
+                e = SSHException(
+                    "SSH connection closed before global request was "
+                    "answered"
+                )
+            raise e
+
+    def _discard_global_response(self, waiter):
+        """
+        Remove a waiter that can never receive a reply (eg because sending
+        the request itself failed).  Entries that were already resolved or
+        removed are left untouched.
+        """
+        if waiter is None:
+            return
+        with self._global_response_lock:
+            if waiter.status == _GlobalRequestResponse.PENDING:
+                try:
+                    self._global_responses.remove(waiter)
+                except ValueError:
+                    pass
+
+    def _abort_global_responses(self):
+        """
+        Resolve every still-pending global request as failed due to the
+        transport shutting down.
+
+        Requests that already received a reply, or that the caller gave up
+        on locally, keep their existing single outcome; in particular a
+        success that was delivered just before shutdown is not turned into
+        a close failure.
+        """
+        with self._global_response_lock:
+            while self._global_responses:
+                waiter = self._global_responses.popleft()
+                if waiter.status == _GlobalRequestResponse.PENDING:
+                    waiter.status = _GlobalRequestResponse.CLOSED
+                    waiter.event.set()
 
     def accept(self, timeout=None):
         """
@@ -1765,6 +1898,7 @@ class Transport(threading.Thread, ClosingContextManager):
     def stop_thread(self):
         self.active = False
         self.packetizer.close()
+        self._abort_global_responses()
         # Keep trying to join() our main thread, quickly, until:
         # * We join()ed successfully (self.is_alive() == False)
         # * Or it looks like we've hit issue #520 (socket.recv hitting some
@@ -2170,6 +2304,7 @@ class Transport(threading.Thread, ClosingContextManager):
                 self.packetizer.close()
                 if self.completion_event is not None:
                     self.completion_event.set()
+                self._abort_global_responses()
                 if self.auth_handler is not None:
                     self.auth_handler.abort()
                 for event in self.channel_events.values():
@@ -2824,14 +2959,41 @@ class Transport(threading.Thread, ClosingContextManager):
     def _parse_request_success(self, m):
         self._log(DEBUG, "Global request successful.")
         self.global_response = m
-        if self.completion_event is not None:
-            self.completion_event.set()
+        with self._global_response_lock:
+            waiter = (
+                self._global_responses.popleft()
+                if self._global_responses
+                else None
+            )
+            if (
+                waiter is not None
+                and waiter.status == _GlobalRequestResponse.PENDING
+            ):
+                waiter.status = _GlobalRequestResponse.SUCCESS
+                waiter.response = m
+                waiter.event.set()
+        if waiter is None:
+            self._log(
+                DEBUG,
+                "Ignoring global request success with no outstanding "
+                "request.",
+            )
 
     def _parse_request_failure(self, m):
         self._log(DEBUG, "Global request denied.")
         self.global_response = None
-        if self.completion_event is not None:
-            self.completion_event.set()
+        with self._global_response_lock:
+            waiter = (
+                self._global_responses.popleft()
+                if self._global_responses
+                else None
+            )
+            if (
+                waiter is not None
+                and waiter.status == _GlobalRequestResponse.PENDING
+            ):
+                waiter.status = _GlobalRequestResponse.FAILURE
+                waiter.event.set()
 
     def _parse_channel_open_success(self, m):
         chanid = m.get_int()
