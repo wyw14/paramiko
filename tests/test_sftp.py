@@ -23,18 +23,37 @@ a real actual sftp server is contacted, and a new folder is created there to
 do test file operations in (so no existing files will be harmed).
 """
 
+import gc
 import os
 import socket
 import sys
+import threading
 import warnings
+import weakref
 from binascii import hexlify
+from collections import deque
 from io import StringIO
 from tempfile import mkstemp
 
 import pytest
 
 from paramiko.common import o777, o600, o666, o644
+from paramiko.message import Message
+from paramiko.sftp import (
+    BaseSFTP,
+    CMD_CLOSE,
+    CMD_HANDLE,
+    CMD_NAME,
+    CMD_OPEN,
+    CMD_OPENDIR,
+    CMD_READDIR,
+    CMD_STATUS,
+    SFTP_EOF,
+    SFTP_FAILURE,
+    SFTP_OK,
+)
 from paramiko.sftp_attr import SFTPAttributes
+from paramiko.sftp_client import SFTPClient, _SFTPDirectoryIterator
 from paramiko.util import b, u
 from tests import requireNonAsciiLocale
 
@@ -271,6 +290,145 @@ class TestSFTP:
             sftp.remove(sftp.FOLDER + "/duck.txt")
             sftp.remove(sftp.FOLDER + "/fish.txt")
             sftp.remove(sftp.FOLDER + "/tertiary.py")
+
+    def _populate_listdir(self, sftp, count):
+        for i in range(count):
+            sftp.open("{}/file{:02d}".format(sftp.FOLDER, i), "w").close()
+
+    def _cleanup_listdir(self, sftp, count):
+        for i in range(count):
+            sftp.remove("{}/file{:02d}".format(sftp.FOLDER, i))
+
+    def _command_spy(self, sftp):
+        seen = []
+        original = sftp._async_request
+
+        def spy(fileobj, t, *args):
+            seen.append(t)
+            return original(fileobj, t, *args)
+
+        sftp._async_request = spy
+        return seen
+
+    def test_listdir_iter_closes_handle_on_break(self, sftp):
+        """
+        stopping a listdir_iter early (then closing it) sends exactly one
+        close and leaves the client usable for file opens and more listings
+        """
+        try:
+            self._populate_listdir(sftp, 3)
+            seen = self._command_spy(sftp)
+            iterator = sftp.listdir_iter(sftp.FOLDER)
+            next(iterator)
+            iterator.close()
+            assert seen.count(CMD_CLOSE) == 1
+            # idempotent: no second close packet for a dead handle
+            iterator.close()
+            assert seen.count(CMD_CLOSE) == 1
+
+            # the same client must still work: open a file ...
+            with sftp.open(sftp.FOLDER + "/duck.txt", "w") as f:
+                f.write(b"quack")
+            with sftp.open(sftp.FOLDER + "/duck.txt", "r") as f:
+                assert f.read() == b"quack"
+
+            # ... and list the directory again, fully, with one new
+            # directory-handle close (the two file closes above also show
+            # up in the spy, so compare against the current count)
+            closes_before = seen.count(CMD_CLOSE)
+            again = [
+                x.filename for x in sftp.listdir_iter(sftp.FOLDER, 1)
+            ]
+            assert sorted(again) == sorted(
+                ["file00", "file01", "file02", "duck.txt"]
+            )
+            assert seen.count(CMD_CLOSE) == closes_before + 1
+            sftp.remove(sftp.FOLDER + "/duck.txt")
+        finally:
+            self._cleanup_listdir(sftp, 3)
+
+    def test_listdir_iter_closes_handle_on_exception(self, sftp):
+        """
+        an exception raised while iterating a directory used as a context
+        manager still reaps the remote handle exactly once
+        """
+        try:
+            self._populate_listdir(sftp, 3)
+            seen = self._command_spy(sftp)
+            with pytest.raises(RuntimeError):
+                with sftp.listdir_iter(sftp.FOLDER) as iterator:
+                    next(iterator)
+                    raise RuntimeError("boom")
+            assert seen.count(CMD_CLOSE) == 1
+            # client survives and lists normally afterwards
+            assert len(list(sftp.listdir_iter(sftp.FOLDER))) == 3
+            assert seen.count(CMD_CLOSE) == 2
+        finally:
+            self._cleanup_listdir(sftp, 3)
+
+    def test_listdir_iter_closes_handle_on_gc(self, sftp):
+        """
+        an abandoned, un-closed iterator closes its remote handle once it is
+        garbage collected, without waiting for any remote timeout
+        """
+        try:
+            self._populate_listdir(sftp, 3)
+            seen = self._command_spy(sftp)
+
+            def abandon():
+                iterator = sftp.listdir_iter(sftp.FOLDER)
+                next(iterator)
+                # function returns without closing the iterator
+
+            abandon()
+            gc.collect()
+            assert seen.count(CMD_CLOSE) == 1
+            gc.collect()
+            assert seen.count(CMD_CLOSE) == 1
+
+            # no stale readdir responses are left in the stream: the client
+            # keeps working normally
+            assert sorted(
+                x.filename for x in sftp.listdir_iter(sftp.FOLDER)
+            ) == ["file00", "file01", "file02"]
+        finally:
+            self._cleanup_listdir(sftp, 3)
+
+    def test_listdir_iter_client_close_reaps_handle(self, sftp):
+        """
+        closing the SFTPClient reaps a directory handle left open by an
+        iterator that was only partially consumed
+        """
+        # the test folder is removed wholesale by the fixture teardown;
+        # the client itself is closed in this test
+        self._populate_listdir(sftp, 3)
+        seen = self._command_spy(sftp)
+        iterator = sftp.listdir_iter(sftp.FOLDER)
+        next(iterator)
+        sftp.close()
+        assert seen.count(CMD_CLOSE) == 1
+        # a closed iterator stops cleanly instead of touching the dead
+        # channel (which would surface as a network error)
+        with pytest.raises(StopIteration):
+            next(iterator)
+
+    def test_listdir_iter_paginated_entries_once(self, sftp):
+        """
+        entries spread over several server pages are delivered exactly once
+        and the handle is closed exactly once at the terminal page
+        """
+        try:
+            self._populate_listdir(sftp, 20)
+            seen = self._command_spy(sftp)
+            names = [
+                x.filename
+                for x in sftp.listdir_iter(sftp.FOLDER, read_aheads=2)
+            ]
+            assert len(names) == 20
+            assert len(set(names)) == 20
+            assert seen.count(CMD_CLOSE) == 1
+        finally:
+            self._cleanup_listdir(sftp, 20)
 
     @requireNonAsciiLocale()
     def test_listdir_in_locale(self, sftp):
@@ -830,3 +988,246 @@ class TestSFTP:
                 assert f.read() == data
         finally:
             sftp.remove(f"{sftp.FOLDER}/write_memoryview")
+
+
+# Scripted SFTP response packet builders (payload includes the request id,
+# exactly as BaseSFTP._read_packet returns it).
+
+
+def _handle_response(num, handle=b"dir-handle"):
+    msg = Message()
+    msg.add_int(num)
+    msg.add_string(handle)
+    return CMD_HANDLE, msg.asbytes()
+
+
+def _name_response(num, names):
+    msg = Message()
+    msg.add_int(num)
+    msg.add_int(len(names))
+    for name in names:
+        msg.add_string(name)
+        msg.add_string("")
+        SFTPAttributes()._pack(msg)
+    return CMD_NAME, msg.asbytes()
+
+
+def _status_response(num, code, text=""):
+    msg = Message()
+    msg.add_int(num)
+    msg.add_int(code)
+    msg.add_string(text)
+    msg.add_string("")
+    return CMD_STATUS, msg.asbytes()
+
+
+class FakeSFTPClient(BaseSFTP):
+    """
+    Minimal SFTPClient stand-in that serves a scripted packet stream and
+    records outgoing commands, while reusing the real response/status logic.
+    """
+
+    _read_response = SFTPClient._read_response
+    _convert_status = SFTPClient._convert_status
+
+    def __init__(self, responses=()):
+        super().__init__()
+        self._lock = threading.Lock()
+        self._cwd = None
+        self.request_number = 1
+        self._expecting = weakref.WeakValueDictionary()
+        self._open_directories = weakref.WeakSet()
+        self._responses = deque(responses)
+        self.commands = []
+        self.closed = False
+
+    def _adjust_cwd(self, path):
+        return path
+
+    def _async_request(self, fileobj, t, *args):
+        with self._lock:
+            num = self.request_number
+            self.request_number += 1
+            self._expecting[num] = fileobj
+        self.commands.append((t, args))
+        return num
+
+    def _request(self, t, *args):
+        num = self._async_request(type(None), t, *args)
+        return self._read_response(num)
+
+    def _read_packet(self):
+        return self._responses.popleft()
+
+    def close(self):
+        for directory in list(self._open_directories):
+            directory.close()
+        self.closed = True
+
+
+class TestSFTPDirectoryIterator:
+    """deterministic, network-free tests of handle lifecycle semantics"""
+
+    def test_full_listing_closes_once_and_drains_eof(self):
+        fake = FakeSFTPClient(
+            [
+                _handle_response(1),
+                _name_response(2, ["a", "b"]),
+                _name_response(3, ["c"]),
+                _status_response(4, SFTP_EOF, "End of file"),
+                _status_response(5, SFTP_OK),
+            ]
+        )
+        iterator = _SFTPDirectoryIterator(fake, ".", read_aheads=3)
+        assert [x.filename for x in iterator] == ["a", "b", "c"]
+        # exactly one close, sent after the readdir batch, and every
+        # scripted packet (including the trailing EOFs) was consumed
+        assert [t for t, args in fake.commands] == [
+            CMD_OPENDIR,
+            CMD_READDIR,
+            CMD_READDIR,
+            CMD_READDIR,
+            CMD_CLOSE,
+        ]
+        assert not fake._responses
+        assert not fake._expecting
+
+    def test_early_close_drains_and_keeps_client_usable(self):
+        fake = FakeSFTPClient(
+            [
+                _handle_response(1),
+                _name_response(2, ["a", "b", "c"]),
+                _status_response(3, SFTP_EOF),
+                # a server racing CLOSE with the last page may answer the
+                # remaining pipelined readdirs with an error; it must be
+                # discarded, not raised as a listing/network error
+                _status_response(4, SFTP_FAILURE, "Invalid handle"),
+                _status_response(5, SFTP_OK),
+            ]
+        )
+        iterator = _SFTPDirectoryIterator(fake, ".", read_aheads=3)
+        assert next(iterator).filename == "a"
+        iterator.close()
+        iterator.close()  # idempotent
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+        assert not fake._responses
+        assert not fake._expecting
+        # entries already buffered are never delivered twice
+        with pytest.raises(StopIteration):
+            next(iterator)
+        assert list(iterator) == []
+
+        # the same client immediately serves an unrelated request correctly
+        fake._responses.append(_handle_response(6))
+        t, msg = fake._request(CMD_OPEN, "other-file")
+        assert t == CMD_HANDLE
+        assert not fake._responses
+
+    def test_garbage_collection_reaps_handle(self):
+        fake = FakeSFTPClient(
+            [
+                _handle_response(1),
+                _name_response(2, ["a", "b"]),
+                _status_response(3, SFTP_EOF),
+                _status_response(4, SFTP_EOF),
+                _status_response(5, SFTP_OK),
+            ]
+        )
+
+        def abandon():
+            iterator = _SFTPDirectoryIterator(fake, ".", read_aheads=3)
+            next(iterator)
+            # dropped without an explicit close
+
+        abandon()
+        gc.collect()
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+        assert not fake._responses
+        assert not fake._expecting
+        gc.collect()
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+
+    def test_exception_in_caller_reaps_handle(self):
+        fake = FakeSFTPClient(
+            [
+                _handle_response(1),
+                _name_response(2, ["a", "b"]),
+                _status_response(3, SFTP_EOF),
+                _status_response(4, SFTP_EOF),
+                _status_response(5, SFTP_OK),
+            ]
+        )
+        with pytest.raises(RuntimeError):
+            with _SFTPDirectoryIterator(fake, ".", read_aheads=3) as it:
+                assert next(it).filename == "a"
+                raise RuntimeError("boom")
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+        assert not fake._responses
+        with pytest.raises(StopIteration):
+            next(it)
+
+    def test_mid_listing_server_error_still_closes(self):
+        fake = FakeSFTPClient(
+            [
+                _handle_response(1),
+                _status_response(2, SFTP_FAILURE, "nope"),
+                _status_response(3, SFTP_EOF),
+                _status_response(4, SFTP_FAILURE, "Invalid handle"),
+                _status_response(5, SFTP_OK),
+            ]
+        )
+        iterator = _SFTPDirectoryIterator(fake, ".", read_aheads=3)
+        with pytest.raises(IOError):
+            next(iterator)
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+        assert not fake._responses
+        assert not fake._expecting
+
+    def test_client_close_reaps_unconsumed_iterator(self):
+        fake = FakeSFTPClient(
+            [_handle_response(1), _status_response(2, SFTP_OK)]
+        )
+        iterator = _SFTPDirectoryIterator(fake, ".")
+        # never iterated: no readdir requests, but the open handle is
+        # released when the client goes down
+        fake.close()
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+        assert not fake._responses
+        assert fake.closed
+        with pytest.raises(StopIteration):
+            next(iterator)
+
+    def test_paginated_entries_are_delivered_exactly_once(self):
+        fake = FakeSFTPClient(
+            [
+                _handle_response(1),
+                _name_response(2, ["a", "b"]),
+                _name_response(3, ["c", "d"]),
+                _status_response(4, SFTP_EOF),
+                _status_response(5, SFTP_EOF),
+                _status_response(6, SFTP_OK),
+            ]
+        )
+        # read_aheads=2 forces multiple batches; second batch is two EOFs
+        iterator = _SFTPDirectoryIterator(fake, ".", read_aheads=2)
+        names = [x.filename for x in iterator]
+        assert sorted(names) == ["a", "b", "c", "d"]
+        assert len(names) == len(set(names))
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+        assert not fake._responses
+
+    def test_normal_eof_is_not_reported_as_network_error(self):
+        fake = FakeSFTPClient(
+            [
+                _handle_response(1),
+                _status_response(2, SFTP_EOF, "End of file"),
+                _status_response(3, SFTP_EOF),
+                _status_response(4, SFTP_EOF),
+                _status_response(5, SFTP_OK),
+            ]
+        )
+        iterator = _SFTPDirectoryIterator(fake, ".", read_aheads=3)
+        # empty directory: completes silently, no exception of any kind
+        assert list(iterator) == []
+        assert sum(t == CMD_CLOSE for t, args in fake.commands) == 1
+        assert not fake._responses

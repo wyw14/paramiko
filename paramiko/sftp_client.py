@@ -18,6 +18,7 @@
 
 
 from binascii import hexlify
+from collections import deque
 import errno
 import os
 import stat
@@ -87,6 +88,172 @@ def _to_unicode(s):
 b_slash = b"/"
 
 
+class _SFTPDirectoryIterator(ClosingContextManager):
+    """
+    Iterator over a remote directory that owns its SFTP directory handle.
+
+    The underlying handle is guaranteed to be released exactly once, no
+    matter how iteration ends:
+
+    * exhausting the iterator (the server's terminal ``SSH_FX_EOF`` is a
+      normal end of listing, not a network error);
+    * abandoning iteration partway (``break`` or only taking a few entries);
+    * an exception raised by the caller while iterating;
+    * the owning `.SFTPClient` being closed;
+    * this object being garbage collected without an explicit `close`.
+
+    Responses to ``SSH_FXP_READDIR`` requests that were pipelined ahead are
+    drained before sending ``SSH_FXP_CLOSE``, so the connection stays aligned
+    and the same `.SFTPClient` can immediately be reused to open files or
+    list other directories.  Entries already received are buffered and
+    handed out at most once.
+
+    Instances are iterators and context managers.
+    """
+
+    def __init__(self, sftp, path, read_aheads=50):
+        self._sftp = sftp
+        self._read_aheads = read_aheads
+        self._buffer = deque()
+        self._pending = deque()
+        self._handle = None
+        self._eof = False
+        self._closed = False
+        self._lock = threading.Lock()
+        path = sftp._adjust_cwd(path)
+        sftp._log(DEBUG, "listdir_iter({!r})".format(path))
+        t, msg = sftp._request(CMD_OPENDIR, path)
+        if t != CMD_HANDLE:
+            raise SFTPError("Expected handle")
+        self._handle = msg.get_binary()
+        sftp._open_directories.add(self)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        # A closed iterator is exhausted immediately, like a closed
+        # generator, even if undelivered entries are still buffered.
+        if self._closed:
+            raise StopIteration
+        # Serve entries already received from the (pipelined) server
+        # responses before asking for more.
+        while True:
+            if self._buffer:
+                return self._buffer.popleft()
+            if self._eof:
+                # Normal end of listing reached in a previous call.
+                self.close()
+                raise StopIteration
+            try:
+                self._read_more()
+            except EOFError:
+                # Terminal SSH_FX_EOF: the listing is done, this is not a
+                # dropped connection.  Reap the handle and stop cleanly.
+                self._eof = True
+                self.close()
+                raise StopIteration
+            except Exception:
+                # The server side handle would leak on a mid-listing failure
+                # as well; close it, but never mask the original error.
+                self.close()
+                raise
+
+    def close(self):
+        """
+        Close the remote directory handle.
+
+        Idempotent and safe to call from a garbage collector: only the first
+        call (including the implicit one triggered by end of listing) sends
+        ``SSH_FXP_CLOSE``.  Outstanding pipelined ``SSH_FXP_READDIR``
+        responses are drained first.  Never raises, since the handle may
+        have outlived the connection.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._reap_handle()
+        except Exception:
+            # Best effort: this routinely runs from __del__, possibly on a
+            # dead connection or during interpreter shutdown.
+            try:
+                self._sftp._log(
+                    DEBUG, "ignored error while closing directory handle"
+                )
+            except Exception:
+                pass
+        try:
+            self._sftp._open_directories.discard(self)
+        except Exception:
+            pass
+
+    def __del__(self):
+        # Release the remote handle on garbage collection instead of
+        # waiting for a server-side timeout.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # ...internals...
+
+    def _read_more(self):
+        # Pipeline a batch of READDIR requests once the previous batch's
+        # responses have been consumed (section 6.7 of the SFTP RFC).
+        if not self._pending:
+            for _ in range(self._read_aheads):
+                num = self._sftp._async_request(
+                    type(None), CMD_READDIR, self._handle
+                )
+                self._pending.append(num)
+        self._pending.popleft()
+        t, data = self._sftp._read_packet()
+        msg = Message(data)
+        num = msg.get_int()
+        self._forget(num)
+        if t == CMD_STATUS:
+            # Raises EOFError on SSH_FX_EOF (normal end), IOError otherwise.
+            self._sftp._convert_status(msg)
+        if t != CMD_NAME:
+            raise SFTPError("Expected name response")
+        count = msg.get_int()
+        for _ in range(count):
+            filename = msg.get_text()
+            longname = msg.get_text()
+            attr = SFTPAttributes._from_msg(msg, filename, longname)
+            if (filename != ".") and (filename != ".."):
+                self._buffer.append(attr)
+
+    def _forget(self, num):
+        # Drop the response bookkeeping the client created in
+        # _async_request; responses are read here directly.
+        try:
+            with self._sftp._lock:
+                self._sftp._expecting.pop(num, None)
+        except Exception:
+            pass
+
+    def _reap_handle(self):
+        if self._handle is None:
+            return
+        # Consume (and discard) every response to a READDIR we still had in
+        # flight before closing, so later requests on this SFTPClient can't
+        # see them.  Their payload is irrelevant: in particular, trailing
+        # SSH_FX_EOF and post-close "invalid handle" statuses are an
+        # expected consequence of pipelining past the last page and must
+        # never be turned into errors for the caller.
+        while self._pending:
+            self._pending.popleft()
+            t, data = self._sftp._read_packet()
+            msg = Message(data)
+            num = msg.get_int()
+            self._forget(num)
+        # Exactly one CLOSE is ever sent for the opened handle.
+        self._sftp._request(CMD_CLOSE, self._handle)
+
+
 class SFTPClient(BaseSFTP, ClosingContextManager):
     """
     SFTP client object.
@@ -119,6 +286,10 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         self._cwd = None
         # request # -> SFTPFile
         self._expecting = weakref.WeakValueDictionary()
+        # open directory iterators owning remote handles, so they can be
+        # reaped when this client closes (held weakly: their garbage
+        # collection must also be able to release the handle)
+        self._open_directories = weakref.WeakSet()
         if type(sock) is Channel:
             # override default logger
             transport = self.sock.get_transport()
@@ -189,9 +360,17 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         """
         Close the SFTP session and its underlying channel.
 
+        Any directory handles still held by open `listdir_iter` iterators
+        are released first, while the channel can still carry the requests.
+
         .. versionadded:: 1.4
         """
         self._log(INFO, "sftp session closed.")
+        for directory in list(self._open_directories):
+            try:
+                directory.close()
+            except Exception:
+                pass
         self.sock.close()
 
     def get_channel(self):
@@ -271,57 +450,19 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         should suffice for most file listings as each request/response cycle
         may contain multiple files (dependent on server implementation.)
 
+        The returned iterator owns the remote directory handle and releases
+        it automatically: it is safe to stop consuming entries early (via
+        ``break`` or an exception), to call `.close` on this client, or to
+        simply drop the iterator.  It may also be used as a context manager
+        and closed explicitly; doing so is idempotent.
+
         .. versionadded:: 1.15
+        .. versionchanged:: 5.0
+            Returns a closable iterator object that always releases the
+            remote directory handle, including on early termination and
+            garbage collection, instead of only when fully consumed.
         """
-        path = self._adjust_cwd(path)
-        self._log(DEBUG, "listdir({!r})".format(path))
-        t, msg = self._request(CMD_OPENDIR, path)
-
-        if t != CMD_HANDLE:
-            raise SFTPError("Expected handle")
-
-        handle = msg.get_string()
-
-        nums = list()
-        while True:
-            try:
-                # Send out a bunch of readdir requests so that we can read the
-                # responses later on Section 6.7 of the SSH file transfer RFC
-                # explains this
-                # http://filezilla-project.org/specs/draft-ietf-secsh-filexfer-02.txt
-                for i in range(read_aheads):
-                    num = self._async_request(type(None), CMD_READDIR, handle)
-                    nums.append(num)
-
-                # For each of our sent requests
-                # Read and parse the corresponding packets
-                # If we're at the end of our queued requests, then fire off
-                # some more requests
-                # Exit the loop when we've reached the end of the directory
-                # handle
-                for num in nums:
-                    t, pkt_data = self._read_packet()
-                    msg = Message(pkt_data)
-                    new_num = msg.get_int()
-                    if num == new_num:
-                        if t == CMD_STATUS:
-                            self._convert_status(msg)
-                    count = msg.get_int()
-                    for i in range(count):
-                        filename = msg.get_text()
-                        longname = msg.get_text()
-                        attr = SFTPAttributes._from_msg(
-                            msg, filename, longname
-                        )
-                        if (filename != ".") and (filename != ".."):
-                            yield attr
-
-                # If we've hit the end of our queued requests, reset nums.
-                nums = list()
-
-            except EOFError:
-                self._request(CMD_CLOSE, handle)
-                return
+        return _SFTPDirectoryIterator(self, path, read_aheads)
 
     def open(self, filename, mode="r", bufsize=-1):
         """
